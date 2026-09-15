@@ -1,0 +1,390 @@
+schemaVersion: '2.2'
+description: >-
+  Master SSM Document for Provisioning Database, Web Apps, Core Services, and Legacy
+  Components
+
+
+parameters:
+  SAPasswordParameterName:
+    type: String
+    default: /ec2/config/sa-password
+    description: The name of the SSM parameter that contains the SA password for the SQL Server instance.
+  DeploymentS3Bucket:
+    type: String
+    description: The name of the S3 bucket where deployment artifacts are stored.
+
+
+mainsteps:
+  # ------------------------------------------
+  # 1: Install SQL Server 2022 Dev & SSMS
+  # ------------------------------------------
+  - action: aws:runPowerShellScript
+    name: InstallSqlServerAndSsms
+    inputs:
+      runCommand:
+        - |
+          $ErrorActionPreference = "Stop"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          $InstallerDir = "C:\Temp\SQLInstaller"
+          New-Item -ItemType Directory -Path $InstallerDir -Force | Out-Null
+
+          $SAPassword = (Get-SSMParameter -Name "{{ SAPasswordParameterName }}" -WithDecryption $true).Value
+
+          $SQLInstallerPath = Join-Path -Path $InstallerDir -ChildPath "SQLServer2022Dev.exe"
+          if (-not (Get-Service -Name "MSSQLSERVER" -ErrorAction SilentlyContinue)){
+              Write-Host "Downloading and installing SQL Server 2022..."
+              Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2215158" -OutFile $SQLInstallerPath
+              Start-Process -FilePath $SQLInstallerPath -ArgumentList "/Quiet /IAcceptSQLServerLicenseTerms /Action=Install /FEATURES=SQL /InstanceName=MSSQLSERVER /SQLSYSADMINACCOUNTS=`"$env:COMPUTERNAME\Administrator`" /SAPWD=`"$SAPassword`" /SECURITYMODE=SQL" -Wait
+              Remove-Item $SQLInstallerPath -Force
+          } 
+          else {
+                Write-Host "SQL Server 2022 is already installed."
+          }
+          $SSMSInstallerPath = Join-Path -Path $InstallerDir -ChildPath "SSMS-Setup-ENU.exe"
+          $IsInstalled = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                                                "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+                         Where-Object { $_.DisplayName -like "*SQL Server Management Studio*" }
+          if (-not $IsInstalled) {
+              Write-Host "Downloading and installing SQL Server Management Studio..."
+              Invoke-WebRequest -Uri "https://aka.ms/ssmsfullsetup" -OutFile $SSMSInstallerPath
+              Start-Process -FilePath $SSMSInstallerPath -ArgumentList "/install /quiet /norestart" -Wait
+              Remove-Item $SSMSInstallerPath -Force
+          } 
+          else {
+                Write-Host "SQL Server Management Studio is already installed."
+          }
+
+          Write-Host "Configuring SQL sa account settings..."
+          Import-Module SqlServer -ErrorAction Stop
+
+          $InstanceName = "localhost"
+          $SQLScript = @"
+          ALTER LOGIN [sa] WITH CHECK_POLICY = OFF;
+          ALTER LOGIN [sa] ENABLE;
+          "@
+
+          Invoke-Sqlcmd -ServerInstance $InstanceName -Query $SQLScript
+          Write-Host "sa account successfully enabled and policy updated."
+  # -------------------------------------------------------
+  # 2: Database Initialization (schema.sql / init.sql)
+  # -------------------------------------------------------
+  - action: aws:runPowerShellScript
+    name: DatabaseInitialization
+    inputs:
+      runCommand:
+        - |
+          $ErrorActionPreference = "Stop"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          while ((Get-Service -Name "MSSQLSERVER" -ErrorAction SilentlyContinue).Status -ne "Running") {
+                Start-Sleep -Seconds 5
+          }
+
+          $SQLDir = "C:\Temp\SqlScripts"
+          New-Item -ItemType Directory -Path $SQLDir -Force | Out-Null
+          Read-S3Object -BucketName "{{ deploymentS3Bucket }}" -KeyPrefix "sql/" -Folder $SQLDir
+
+          $SAPassword = (Get-SSMParameter -Name "{{ SAPasswordParameterName }}" -WithDecryption $true).Value
+
+          Write-Host "Ensuring database 'pj' exists..."
+          $CreateDbScript = @"
+          IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = N'pj')
+          BEGIN
+              CREATE DATABASE [pj];
+          END
+          "@
+          Invoke-Sqlcmd -ServerInstance "localhost" -U "sa" -P $SAPassword -Query $CreateDbScript -ErrorAction Stop
+
+          foreach ($File in @("schema.sql", "init.sql")) {
+              $FilePath = Join-Path -Path $SQLDir -ChildPath $File
+              if (Test-Path $FilePath) {
+                  Write-Host "Executing $File on database pj..."
+                  Invoke-Sqlcmd -ServerInstance "localhost" -Database "pj" -U "sa" -P $SAPassword -InputFile $FilePath -ErrorAction Stop
+              }
+          }
+  # ---------------------------------------------------------------
+  # 3: Deploy Frontend & Backend Web Apps (Backside, Frontside)
+  # ---------------------------------------------------------------
+  - action: aws:runPowerShellScript
+    name: DeployWebApps
+    inputs:
+      runCommand:
+        - |
+          $ErrorActionPreference = "Stop"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Import -Module WebAdministration
+
+          $SAPassword = (Get-SSMParameter -Name "{{ SAPasswordParameterName }}" -WithDecryption $true).Value
+
+          $Apps = @(
+              @{ 
+                  Name       = "Backside"
+                  AppPool    = "BacksidePool"
+                  Port       = 2401
+                  ConfigFile = "appsettings.production.json"
+                  JsonPath   = "ConnectionStrings.pj_SqlServerDatabase"
+                  Value      = "Server=localhost;Database=pj;User Id=sa;Password=$SAPassword;TrustServerCertificate=true;"
+              },
+              @{ 
+                  Name       = "Frontside"
+                  AppPool    = "FrontsidePool"
+                  Port       = 2402
+                  ConfigFile = "config.json"
+                  JsonPath   = "PLC_LAYOUT_URL"
+                  Value      = "http://127.0.0.1:1002/PLC/getStationInfo"
+              }
+          )
+
+          foreach ($App in $Apps) {
+              $AppPath = Join-Path -Path "C:\inetpub\wwwroot" -ChildPath $App.Name
+              $ZipPath = "C:\Temp\$($App.Name).zip"
+              
+              Read-S3Object -BucketName "{{ deploymentS3Bucket }}" -Key "web/$($App.Name).zip" -File $ZipPath
+
+              if (Test-WebAppPool -Name $App.AppPool) { Stop-WebAppPool -Name $App.AppPool }
+              
+              New-Item -ItemType Directory -Path $AppPath -Force | Out-Null
+              Expand-Archive -Path $ZipPath -DestinationPath $AppPath -Force
+              Remove-Item $ZipPath -Force
+
+              if ($App.ConfigFile) {
+                  $AppSettingsPath = Join-Path -Path $AppPath -ChildPath $App.ConfigFile
+                  if (Test-Path $AppSettingsPath) {
+                      Write-Host "Updating $($App.ConfigFile) for $($App.Name)..."
+                      $json = Get-Content $AppSettingsPath -Raw | ConvertFrom-Json
+            
+                      $keys = $App.JsonPath -split '\.'
+
+                      if ($keys.Count -eq 1) {
+                          $json.($keys[0]) = $App.Value
+                      } 
+                      elseif ($keys.Count -eq 2) {
+                          if (-not $json.($keys[0])) {
+                              $json | Add-Member -MemberType NoteProperty -Name $keys[0] -Value @{}
+                          }
+                          $json.($keys[0]).($keys[1]) = $App.Value
+                      }
+
+                      $json | ConvertTo-Json -Depth 10 | Set-Content $AppSettingsPath -Encoding UTF8
+                  }
+              }
+
+              $LogsPath = Join-Path -Path $AppPath -ChildPath "logs"
+              if (-not (Test-Path $LogsPath)) {
+                  New-Item -ItemType Directory -Path $LogsPath -Force | Out-Null
+              }
+              (Get-Item $LogsPath).IsReadOnly = $false
+
+              if (-not (Test-WebAppPool -Name $App.AppPool)) {
+                  New-WebAppPool -Name $App.AppPool
+                  Set-ItemProperty "IIS:\AppPools\$($App.AppPool)" -Name "managedRuntimeVersion" -Value ""
+              }
+              if (-not (Get-Website -Name $App.Name -ErrorAction SilentlyContinue)) {
+                  New-Website -Name $App.Name -Port $App.Port -PhysicalPath $AppPath -ApplicationPool $App.AppPool
+              }
+              Start-WebAppPool -Name $App.AppPool
+          }
+  # --------------------------------------------------
+  # 4: Install and Configure dummyAGC & Satellite
+  # --------------------------------------------------
+  - action: aws:runPowerShellScript
+    name: DeployCoreServices
+    inputs:
+      runCommand:
+        - |
+          $ErrorActionPreference = "Stop"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          $WorkDir = "C:\Temp\dummyAGC"
+          New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
+
+          $ZipPath = Join-Path $WorkDir "dummyAGC_setting.zip"
+          Read-S3Object -BucketName "{{ deploymentS3Bucket }}" -Key "tools/dummyAGC_setting.zip" -File $ZipPath
+          Expand-Archive -Path $ZipPath -DestinationPath $WorkDir -Force
+          Remove-Item $ZipPath -Force
+
+          $SatelliteSetup = Get-ChildItem -Path $WorkDir -Recurse -Filter "setup.exe" | Select-Object -First 1
+          if ($SatelliteSetup) {
+              Write-Host "Installing Satellite silently..."
+              Start-Process -FilePath $SatelliteSetup.FullName -ArgumentList "/s" -Wait
+          }
+
+          $SatelliteDir = "C:\DF\Satellite\Tcplp"
+          if (-not (Test-Path $SatelliteDir)) {
+              New-Item -ItemType Directory -Path $SatelliteDir -Force | Out-Null
+          }
+          $ConfigPath = Join-Path $SatelliteDir "tcplp.ini"
+          $ConfigContent = @"
+          [Configuration]
+          MaxTask=5
+          MaxConnections=120
+          StartupParameter=/m:0 /p:2000
+          [PortSetting]
+          No1_Type=Server
+          No1_Port=2000
+          No2_Type=Server
+          No2_Port=2001
+          No3_Type=Server
+          No3_Port=2002
+          No4_Type=Server
+          No4_Port=2003
+          "@
+          Set-Content -Path $ConfigPath -Value $ConfigContent -Encoding ASCII
+          Write-Host "Satellite Configuration generated at $ConfigPath"
+
+          $SourceDll = Join-Path $SatelliteDir "Bin\SateSub.dll"
+          $TargetDir = "C:\Windows\SysWOW64"
+          if (Test-Path $SourceDll) {
+              Copy-Item -Path $SourceDll -Destination $TargetDir -Force
+          }
+
+          $HostsPath = "C:\Windows\System32\drivers\etc\hosts"
+          Set-ItemProperty -Path $HostsPath -Name IsReadOnly -Value $false
+          $HostsContent = Get-Content $HostsPath -Raw
+          if ($HostsContent -notmatch "pj-server") {
+              Add-Content -Path $HostsPath -Value "`n127.0.0.1    pj-server"
+          }
+          Start-Process -FilePath "ipconfig.exe" -ArgumentList "/flushdns" -Wait -NoNewWindow
+
+          $NtsateExe = Join-Path $SatelliteDir "bin\ntsate.exe"
+          if (Test-Path $NtsateExe) {
+              Write-Host "Starting Satellite Background Service..."
+              $Params = "/M:0 /P:2000 /M:0 /P:2001 /M:0 /P:2002 /M:0 /P:2003"
+              Start-Process -FilePath $NtsateExe -ArgumentList $Params -WindowStyle Hidden
+          }
+
+          $DummySetup = Get-ChildItem -Path $WorkDir -Recurse -Filter "setup.exe" | Where-Object { $_.DirectoryName -ne $SatelliteSetup.DirectoryName } | Select-Object -First 1
+          if ($DummySetup) {
+              Start-Process -FilePath $DummySetup.FullName -ArgumentList "/s" -Wait
+          }
+
+          #start dummyAGC service
+          $InitExe = "C:\Program Files (x86)\DummyAGC2002\Init\DmyAGCInit.EXE"
+          if (Test-Path $InitExe) {
+              Write-Host "Executing DmyAGCInit.EXE..."
+              Start-Process -FilePath $InitExe -Wait
+          } else {
+              Write-Warning "DmyAGCInit.EXE not found at $InitExe"
+          }
+
+          $TargetExe = "C:\Program Files (x86)\DummyAGC2002\Bin\DmyAgc.exe"
+          $DesktopPath = [System.IO.Path]::Combine([System.Environment]::GetFolderPath("CommonDesktopDirectory"), "DummyAGC.lnk")
+          if (Test-Path $TargetExe) {
+              Write-Host "Creating Administrator Shortcut for DmyAgc.exe..."
+              $WScriptShell = New-Object -ComObject WScript.Shell
+              $Shortcut = $WScriptShell.CreateShortcut($DesktopPath)
+              $Shortcut.TargetPath = $TargetExe
+              $Shortcut.WorkingDirectory = "C:\Program Files (x86)\DummyAGC2002\Bin"
+              $Shortcut.Save()
+
+              $bytes = [System.IO.File]::ReadAllBytes($DesktopPath)
+              $bytes[21] = $bytes[21] -bor 0x20
+              [System.IO.File]::WriteAllBytes($DesktopPath, $bytes)
+          }
+
+          $IniPath = "C:\Program Files (x86)\DummyAGC2002\Bin\DmyAGC.ini"
+          if (-not (Test-Path $IniPath)) { $IniPath = "C:\Windows\DmyAGC.ini" }
+          Write-Host "Configuring Machine Name 'pj-server' in ini file..."
+          $IniContent = @"
+          [System]
+          MachineName=pj-server
+          PortNo=2000
+          LinkType=Tcplp
+          "@
+          Set-Content -Path $IniPath -Value $IniContent -Encoding ASCII
+
+          Write-Host "Launching DmyAgc.exe..."
+          Start-Process -FilePath $TargetExe -Verb RunAs -WindowStyle Hidden
+
+  # ----------------------------------------------------------------------
+  # 5: Configure DBLink, Deploy Modules, and Launch ASRS Services
+  # ----------------------------------------------------------------------
+  - action: aws:runPowerShellScript
+    name: DeployAndLaunchWmsServices
+    inputs:
+      runCommand:
+        - |
+          $ErrorActionPreference = "Stop"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          $BaseDir = "C:\DF"
+          $WorkDir = Join-Path $BaseDir "Services"
+          New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
+
+          $DbLinkPath = Join-Path $WorkDir "DBLink.xml"
+          Write-Host "Fetching SA password from SSM Parameter Store..."
+          $SAPassword = (Get-SSMParameter -Name "{{ SAPasswordParameterName }}" -WithDecryption $true).Value
+
+          Write-Host "Configuring DBLink.xml..."
+          $DbLinkContent = @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <Configurations>
+          <connectionStrings>
+          <!-- DBConnect DatabaseType="MSSQL_DB" -->
+          <DBConnect DatabaseType="MSSQL_DB"
+                     Server="PJ-SERVER\MSSQLSERVER01"
+                     DBName="pj"
+                     Password="$SAPassword"
+                     UserId="sa"
+                     IsusingConnectionString="false"
+                    connectionString="server=PJ-SERVER\MSSQLSERVER01;database=pj;uid=sa;pwd=$SAPassword" />
+          </connectionStrings>
+          </Configurations>
+          "@
+          Set-Content -Path $DbLinkPath -Value $DbLinkContent -Encoding UTF8
+
+          $Packages = @("pj_MC_Controller", "pj_PlcController", "pj_WmsServer")
+          $7zipExe = "C:\Program Files\7-Zip\7z.exe"
+
+          foreach ($Pkg in $Packages) {
+              $ZipFile = Join-Path $BaseDir "$Pkg.7z"
+              $ExtractTarget = Join-Path $WorkDir $Pkg
+
+              if (Test-Path $ZipFile) {
+                  Write-Host "Extracting $ZipFile to $ExtractTarget..."
+                  if (Test-Path $7zipExe) {
+                      Start-Process -FilePath $7zipExe -ArgumentList "x `"$ZipFile`" -o`"$ExtractTarget`" -y" -Wait
+                  } else {
+                      Expand-Archive -Path $ZipFile -DestinationPath $ExtractTarget -Force
+                  }
+              }
+              if (Test-Path $ExtractTarget) {
+                  Write-Host "Copying configuration XMLs to $ExtractTarget..."
+                  Copy-Item -Path $DbLinkPath -Destination $ExtractTarget -Force
+                
+                  $WmsIoCfgSrc = Join-Path $BaseDir "WMS_IOCFG.xml"
+                  if (Test-Path $WmsIoCfgSrc) {
+                      Copy-Item -Path $WmsIoCfgSrc -Destination $ExtractTarget -Force
+                  }
+              }
+          }
+
+          $AsrsExe = Join-Path $WorkDir "pj_WmsServer\ASRSServer.exe"
+          if (Test-Path $AsrsExe) {
+              Write-Host "Launching ASRSServer.exe..."
+              Start-Process -FilePath $AsrsExe -WorkingDirectory (Split-Path $AsrsExe)
+              Start-Sleep -Seconds 3
+          }
+          $McExe = Join-Path $WorkDir "pj_MC_Controller\MC_Controller.exe"
+          if (Test-Path $McExe) {
+              Write-Host "Launching MC_Controller.exe..."
+              Start-Process -FilePath $McExe -WorkingDirectory (Split-Path $McExe)
+              Start-Sleep -Seconds 3
+          }
+          $PlcExe = Join-Path $WorkDir "pj_PlcController\PLC_Controller.exe"
+          if (Test-Path $PlcExe) {
+              Write-Host "Launching PLC_Controller.exe..."
+              Start-Process -FilePath $PlcExe -WorkingDirectory (Split-Path $PlcExe)
+              Start-Sleep -Seconds 3
+          }
+
+          $Processes = @("ASRSServer", "MC_Controller", "PLC_Controller")
+          foreach ($Proc in $Processes) {
+              $Running = Get-Process -Name $Proc -ErrorAction SilentlyContinue
+              if ($Running) {
+                  Write-Host "Verification Success: $Proc is running (PID: $($Running.Id))"
+              } else {
+                  Write-Warning "Verification Warning: $Proc process was not detected!"
+              }
+          }

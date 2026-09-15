@@ -1,0 +1,400 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Staging Deployment Template
+
+
+Parameters:
+  LatestWindowsAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base
+    Description: The latest Windows AMI ID from SSM Parameter Store
+  ServerCertificateArn:
+    Type: String
+    Description: The ARN of the ACM certificate for the server(e.g. arn:aws:acm:region:account-id:certificate/certificate-id)
+  SamlProviderArn:
+    Type: String
+    Description: The ARN of the SAML provider in IAM (e.g. arn:aws:iam::account-id:saml-provider/provider-name)
+  S3DocumentUrl:
+    Type: String
+    Description: S3 URL for the external SSM Document (e.g., https://s3.amazonaws.com/my-bucket/ssm-doc.yaml)
+
+
+Resources:
+  # Staging VPC & IGW
+  StagingVPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: '10.100.0.0/16'
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub
+            - staging-vpc-${AWS::StackName}
+  StagingIGW:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub
+            - staging-igw-${AWS::StackName}
+  AttachIGW:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: 
+        Ref: StagingVPC
+      InternetGatewayId: 
+        Ref: StagingIGW
+  # Staging Subnets
+  PublicSubnet:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: 
+        Ref: StagingVPC
+      CidrBlock: '10.100.1.0/24'
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: 
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ''
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub
+            - staging-public-subnet-${AWS::StackName}
+  PrivateSubnetA:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: 
+        Ref: StagingVPC
+      CidrBlock: '10.100.10.0/24'
+      AvailabilityZone: 
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ''
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub
+            - staging-private-subnet-a-${AWS::StackName}
+  PrivateSubnetB:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: 
+        Ref: StagingVPC
+      CidrBlock: '10.100.20.0/24'
+      AvailabilityZone: 
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ''
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub
+            - staging-private-subnet-b-${AWS::StackName}
+  # Nat Gateway
+  StagingEIP:
+    Type: 'AWS::EC2::EIP'
+    Properties:
+      Domain: vpc
+  StagingNatGateway:
+    Type: 'AWS::EC2::NatGateway'
+    Properties:
+      AllocationId: 
+        Fn::GetAtt:
+          - StagingEIP
+          - AllocationId
+      SubnetId: 
+        Ref: PublicSubnet
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub
+            - staging-nat-gateway-${AWS::StackName}
+  # Private Route Table for Windows Updates
+  PrivateRouteTableA:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: 
+        Ref: StagingVPC
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub
+            - staging-private-route-table-a-${AWS::StackName}
+  PrivaterouteToNAT:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: 
+        Ref: PrivateRouteTableA
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: 
+            Ref: StagingNatGateway
+  PrivateSubnetARouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: 
+        Ref: PrivateSubnetA
+      RouteTableId: 
+        Ref: PrivateRouteTableA
+  # SecurityGroup
+  VPNSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: 
+        Ref: StagingVPC
+      Description: 'Security group for VPN access'
+  EC2SecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: 
+        Ref: StagingVPC
+      GroupDescription: 'Security group for EC2 instances'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          SourcesecurityGroupId: 
+            Ref: VPNSecurityGroup
+  # S3 Bucket
+  TestArtifactsBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: 
+        Fn::Sub
+        - test-artifacts-bucket-${AWS::StackName}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+            ExpiredObjectDeleteMarker: true
+          - Id: ExpireIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub
+            - test-artifacts-bucket-${AWS::StackName}
+  # SSM & S3 Role for EC2 Instances
+  EC2Role:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - ec2.amazonaws.com
+            Action: 
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+  EC2InstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+        - Ref: EC2Role
+  EC2S3ReadPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: EC2S3ReadPolicy
+      Roles:
+        - Ref: EC2Role
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - 
+                Fn::Sub
+                - arn:aws:s3:::test-artifacts-bucket-${AWS::StackName}
+              - 
+                Fn::Sub
+                - arn:aws:s3:::test-artifacts-bucket-${AWS::StackName}/*
+  EC2SSMParameterPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: EC2SSMParameterPolicy
+      Roles:
+        - Ref: EC2Role
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+            Resource:
+              - 
+                Fn::Sub
+                - arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ec2/config/*
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+            Resource: '*'
+  # VPC Endpoints for S3 and SSM
+  S3GatewayEndpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcId: 
+        Ref: StagingVPC
+      ServiceName: 
+        Fn::Sub
+        - com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - Ref: PrivateRouteTableA
+  SSMInterfaceEndpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcId: 
+        Ref: StagingVPC
+      ServiceName: 
+        Fn::Sub
+        - com.amazonaws.${AWS::Region}.ssm
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - Ref: PrivateSubnetA
+      SecurityGroupIds:
+        - Ref: EC2SecurityGroup
+  # Client VPN Endpoint
+  ClientVpnEndpoint:
+    Type: 'AWS::EC2::ClientVpnEndpoint'
+    Properties:
+      Description: 'Client VPN endpoint for staging environment'
+      ServerCertificateArn: 
+        Ref: ServerCertificateArn
+      AuthenticationOptions:
+        - Type: federated-authentication
+          FederatedAuthentication:
+            SAMLProviderArn: 
+              Ref: SamlProviderArn
+      ClientCidrBlock: '172.16.0.0/22'
+      ConnectionLogOptions:
+        Enabled: false
+      SecurityGroupIds:
+        - Ref: VPNSecurityGroup
+      VpcId: 
+        Ref: StagingVPC
+  ClientVpnTargetNetworkAssociation:
+    Type: 'AWS::EC2::ClientVpnTargetNetworkAssociation'
+    Properties:
+      ClientVpnEndpointId: 
+        Ref: ClientVpnEndpoint
+      SubnetId: 
+        Ref: PrivateSubnetB
+  ClientVpnAuthorizationRule:
+    Type: 'AWS::EC2::ClientVpnAuthorizationRule'
+    Properties:
+      ClientVpnEndpointId: 
+        Ref: ClientVpnEndpoint
+      TargetNetworkCidr: '10.100.20.0/24'
+      AuthorizeAllGroups: true
+  # EC2 Instance in Private Subnet
+  StagingEC2Instance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      ImageId: 
+        Ref: LatestWindowsAmiId
+      InstanceType: t3.large
+      SubnetId: 
+        Ref: PrivateSubnetA
+      SecurityGroupIds:
+        - Ref: EC2SecurityGroup
+      IamInstanceProfile: 
+        Ref: EC2InstanceProfile
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub
+            - staging-ec2-instance-${AWS::StackName}
+      UserData:
+        Fn::Base64: 
+          Fn::Sub: |
+            <powershell>
+            $ErrorActionPreference = "Stop"
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+            $InstallerDir = "C:\Temp\Installer"
+            New-Item -ItemType Directory -Path $InstallerDir -Force | Out-Null
+
+            # ----------------------------------------------------
+            # 1. Windows Features (IIS, ASP.NET)
+            # ----------------------------------------------------
+            Write-Host "Installing Windows Features (IIS, ASP, ASP.NET 3.5, ASP.NET 4.7)..."
+            Install-WindowsFeature -Name Web-Server, Web-ASP, Web-Asp-Net, Web-Asp-Net45, Web-CGI, Web-Net-Ext45, Web-Mgmt-Console, Web-AppInit -IncludeManagementTools
+
+            # ----------------------------------------------------
+            # 2. .NET 9 SDK & Hosting Bundle
+            # ----------------------------------------------------
+            Write-Host "Downloading and Installing .NET 9 Hosting Bundle & SDK..."
+
+            # (A) Download and silently install .NET 9 Hosting Bundle (Required for hosting web apps on IIS)
+            Write-Host "Downloading .NET 9 Hosting Bundle..."
+            $HostingUrl = "https://dotnetcli.azureedge.net/dotnet/aspnetcore/Runtime/9.0.0/dotnet-hosting-9.0.0-win.exe"
+            $HostingInstaller = Join-Path -Path $InstallerDir -ChildPath "dotnet-hosting-9.0.0-win.exe"
+            Invoke-WebRequest -Uri $HostingUrl -OutFile $HostingInstaller
+            Start-Process -FilePath $HostingInstaller -ArgumentList "/quiet /norestart" -Wait
+            Remove-Item $HostingInstaller -Force
+
+            # (B) Download and silently install .NET 9 SDK (Required for building .NET applications)
+            Write-Host "Downloading .NET 9 SDK..."
+            $SdkUrl = "https://dotnetcli.azureedge.net/dotnet/Sdk/9.0.100/dotnet-sdk-9.0.100-win-x64.exe"
+            $SdkInstaller = Join-Path -Path $InstallerDir -ChildPath "dotnet-sdk-9.0.100-win-x64.exe"
+            Invoke-WebRequest -Uri $SdkUrl -OutFile $SdkInstaller
+            Start-Process -FilePath $SdkInstaller -ArgumentList "/quiet /norestart" -Wait
+            Remove-Item $SdkInstaller -Force
+
+            # ----------------------------------------------------
+            # 3. System Configurations (Hosts File & Timezone)
+            # ----------------------------------------------------
+            Write-Host "Configuring System Settings (Hosts File & Timezone)..."
+
+            # (A) Set system timezone to Taipei Standard Time (UTC+8)
+            Set-TimeZone -Id "Taipei Standard Time"
+
+            # (B) Write entries to system Hosts file
+            $HostsFile = "C:\Windows\System32\drivers\etc\hosts"
+            $HostsName = "staging-ec2-instance-$($env:COMPUTERNAME)"
+            $HostEntry = "127.0.0.1 $HostsName"
+            if (-not (Select-String -Path $HostsFile -Pattern $HostsName -Quiet)) {
+            Add-Content -Path $HostsFile -Value "`n$HostEntry"
+            }
+            ipconfig /flushdns
+
+
+            Write-Host "EC2 UserData Bootstrapping Completed!"
+            </powershell>
+  #SSM Document to run additional commands from S3
+  SSMDocument:
+    Type: 'AWS::SSM::Document'
+    Properties:
+      Name: 
+        Fn::Sub
+        - staging-ssm-document-${AWS::StackName}
+      DocumentType: Command
+      DocumentFormat: YAML
+      Content:
+        Ref: S3DocumentUrl
+Outputs:
