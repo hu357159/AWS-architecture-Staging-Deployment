@@ -16,6 +16,9 @@ Parameters:
   S3DocumentUrl:
     Type: String
     Description: S3 URL for the external SSM Document (e.g., https://s3.amazonaws.com/my-bucket/ssm-doc.yaml)
+  IdentityCenterInstanceArn:
+    Type: String
+    Description: The ARN of the AWS Identity Center instance (e.g., arn:aws:sso:::instance/ssoins-xxxxxxxxxxxxxxxx)
 
 
 Resources:
@@ -139,24 +142,16 @@ Resources:
       RouteTableId: 
         Ref: PrivateRouteTableA
   # SecurityGroup
-  VPNSecurityGroup:
-    Type: 'AWS::EC2::SecurityGroup'
-    Properties:
-      VpcId: 
-        Ref: StagingVPC
-      Description: 'Security group for VPN access'
   EC2SecurityGroup:
     Type: 'AWS::EC2::SecurityGroup'
     Properties:
       VpcId: 
         Ref: StagingVPC
       GroupDescription: 'Security group for EC2 instances'
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 3389
-          ToPort: 3389
-          SourcesecurityGroupId: 
-            Ref: VPNSecurityGroup
+      SecurityGroupIngress: []
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
   # S3 Bucket
   TestArtifactsBucket:
     Type: 'AWS::S3::Bucket'
@@ -190,7 +185,7 @@ Resources:
           Value: 
             Fn::Sub
             - test-artifacts-bucket-${AWS::StackName}
-  # SSM & S3 Role for EC2 Instances
+  # SSM & S3 Role for EC2 Instances  + permissions for SSO users to start SSM sessions
   EC2Role:
     Type: 'AWS::IAM::Role'
     Properties:
@@ -211,6 +206,33 @@ Resources:
     Properties:
       Roles:
         - Ref: EC2Role
+  SSMUserPermissionSet:
+    Type: AWS::SSO::PermissionSet
+    Properties:
+      Name: WMSSSMDeveloperAccess
+      InstanceArn: 
+        Ref: IdentityCenterInstanceArn
+      SessionDuration: PT8H
+      InlinePolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ssm:StartSession
+              - ssm:TerminateSession
+              - ssm:ResumeSession
+            Resource:
+              - 
+                Fn::Sub
+                - arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${MyWindowsInstance}
+              - 
+                arn:aws:ssm:*:*:document/AWS-StartPortForwardingSession
+          - Effect: Allow
+            Action:
+              - ssm:DescribeSessions
+              - ssm:GetConnectionStatus
+              - ec2:DescribeInstances
+            Resource: "*"
   EC2S3ReadPolicy:
     Type: 'AWS::IAM::Policy'
     Properties:
@@ -264,39 +286,6 @@ Resources:
       VpcEndpointType: Gateway
       RouteTableIds:
         - Ref: PrivateRouteTableA
-  # Client VPN Endpoint
-  ClientVpnEndpoint:
-    Type: 'AWS::EC2::ClientVpnEndpoint'
-    Properties:
-      Description: 'Client VPN endpoint for staging environment'
-      ServerCertificateArn: 
-        Ref: ServerCertificateArn
-      AuthenticationOptions:
-        - Type: federated-authentication
-          FederatedAuthentication:
-            SAMLProviderArn: 
-              Ref: SamlProviderArn
-      ClientCidrBlock: '172.16.0.0/22'
-      ConnectionLogOptions:
-        Enabled: false
-      SecurityGroupIds:
-        - Ref: VPNSecurityGroup
-      VpcId: 
-        Ref: StagingVPC
-  ClientVpnTargetNetworkAssociation:
-    Type: 'AWS::EC2::ClientVpnTargetNetworkAssociation'
-    Properties:
-      ClientVpnEndpointId: 
-        Ref: ClientVpnEndpoint
-      SubnetId: 
-        Ref: PrivateSubnetB
-  ClientVpnAuthorizationRule:
-    Type: 'AWS::EC2::ClientVpnAuthorizationRule'
-    Properties:
-      ClientVpnEndpointId: 
-        Ref: ClientVpnEndpoint
-      TargetNetworkCidr: '10.100.20.0/24'
-      AuthorizeAllGroups: true
   # EC2 Instance in Private Subnet
   StagingEC2Instance:
     Type: 'AWS::EC2::Instance'
