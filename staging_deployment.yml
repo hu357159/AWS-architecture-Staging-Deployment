@@ -7,12 +7,6 @@ Parameters:
     Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
     Default: /aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base
     Description: The latest Windows AMI ID from SSM Parameter Store
-  ServerCertificateArn:
-    Type: String
-    Description: The ARN of the ACM certificate for the server(e.g. arn:aws:acm:region:account-id:certificate/certificate-id)
-  SamlProviderArn:
-    Type: String
-    Description: The ARN of the SAML provider in IAM (e.g. arn:aws:iam::account-id:saml-provider/provider-name)
   S3DocumentUrl:
     Type: String
     Description: S3 URL for the external SSM Document (e.g., https://s3.amazonaws.com/my-bucket/ssm-doc.yaml)
@@ -81,21 +75,6 @@ Resources:
           Value: 
             Fn::Sub
             - staging-private-subnet-a-${AWS::StackName}
-  PrivateSubnetB:
-    Type: 'AWS::EC2::Subnet'
-    Properties:
-      VpcId: 
-        Ref: StagingVPC
-      CidrBlock: '10.100.20.0/24'
-      AvailabilityZone: 
-        Fn::Select:
-          - 0
-          - Fn::GetAZs: ''
-      Tags:
-        - Key: Name
-          Value: 
-            Fn::Sub
-            - staging-private-subnet-b-${AWS::StackName}
   # Nat Gateway
   StagingEIP:
     Type: 'AWS::EC2::EIP'
@@ -115,7 +94,7 @@ Resources:
           Value: 
             Fn::Sub
             - staging-nat-gateway-${AWS::StackName}
-  # Private Route Table for Windows Updates
+  # Private Route Table for Windows Updates and user login via SSM
   PrivateRouteTableA:
     Type: 'AWS::EC2::RouteTable'
     Properties:
@@ -372,4 +351,3 @@ Resources:
       DocumentFormat: YAML
       Content:
         Ref: S3DocumentUrl
-Outputs:
